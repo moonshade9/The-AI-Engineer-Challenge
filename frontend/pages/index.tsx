@@ -6,18 +6,28 @@ export default function Home() {
   const [userMessage, setUserMessage] = useState('');
   const [response, setResponse] = useState('');
   const [loading, setLoading] = useState(false);
+  const [history, setHistory] = useState([
+    // Optionally, start with the system/developer message
+    // { role: "system", content: developerMessage }
+  ]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setLoading(true);
     setResponse('');
 
+    // Build the full message history
+    const messages = [
+      { role: "system", content: developerMessage },
+      ...history,
+      { role: "user", content: userMessage }
+    ];
+
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        developer_message: developerMessage,
-        user_message: userMessage,
+        messages,
         api_key: apiKey,
       }),
     });
@@ -30,12 +40,24 @@ export default function Home() {
     const reader = res.body.getReader();
     const decoder = new TextDecoder('utf-8');
     let done = false;
+    let assistantReply = '';
     while (!done) {
       const { value, done: doneReading } = await reader.read();
       done = doneReading;
-      if (value) setResponse((prev) => prev + decoder.decode(value));
+      if (value) {
+        const chunk = decoder.decode(value);
+        setResponse((prev) => prev + chunk);
+        assistantReply += chunk;
+      }
     }
     setLoading(false);
+
+    // Update history with the new user message and assistant reply
+    setHistory([
+      ...history,
+      { role: "user", content: userMessage },
+      { role: "assistant", content: assistantReply }
+    ]);
   }
 
   return (
@@ -69,7 +91,13 @@ export default function Home() {
         </label>
         <button type="submit" disabled={loading}>Send</button>
       </form>
-      <pre className="response">{response}</pre>
+      <div className="history">
+        {history.map((msg, idx) => (
+          <div key={idx} className={msg.role}>
+            <b>{msg.role}:</b> {msg.content}
+          </div>
+        ))}
+      </div>
       <style jsx>{`
         .container {
           padding: 2rem;
@@ -102,11 +130,27 @@ export default function Home() {
         button:disabled {
           opacity: 0.6;
         }
-        .response {
+        .history {
+          display: flex;
+          flex-direction: column;
+          gap: 0.5rem;
           margin-top: 2rem;
-          white-space: pre-wrap;
-          border-top: 1px solid #333;
-          padding-top: 1rem;
+        }
+        .user {
+          align-self: flex-end;
+          background: #222;
+          color: #fff;
+          border-radius: 8px;
+          padding: 0.5rem 1rem;
+          max-width: 70%;
+        }
+        .assistant {
+          align-self: flex-start;
+          background: #333;
+          color: #fff;
+          border-radius: 8px;
+          padding: 0.5rem 1rem;
+          max-width: 70%;
         }
       `}</style>
     </main>
