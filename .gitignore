@@ -172,3 +172,5 @@ cython_debug/
 
 # Local CLAUDE.MD
 CLAUDE.local.md
+
+*.old

@@ -1,19 +1,23 @@
-# Import required FastAPI components for building the API
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+# --- RAG-ENABLED FastAPI APP ---
+# This app loads a PDF, builds a vector DB, initializes the RAG pipeline, and exposes a /rag_answer endpoint.
+# You can adapt the ingestion logic as needed for other document types or persistent storage.
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-# Import Pydantic for data validation and settings management
 from pydantic import BaseModel
-# Import OpenAI client for interacting with OpenAI's API
-from openai import OpenAI
+import asyncio
+from typing import Optional
 import os
-from typing import Optional, List, Dict
+import shutil
 
-# Initialize FastAPI application with a title
-app = FastAPI(title="OpenAI Chat API")
+from aimakerspace.text_utils import PDFLoader, DocxLoader, TextFileLoader, MarkdownLoader, CharacterTextSplitter
+from aimakerspace.vectordatabase import VectorDatabase
+from aimakerspace.openai_utils.chatmodel import ChatOpenAI
+from aimakerspace.rag_pipeline import RetrievalAugmentedQAPipeline
 
-# Configure CORS (Cross-Origin Resource Sharing) middleware
-# This allows the API to be accessed from different domains/origins
+app = FastAPI()
+
+# --- Add CORS middleware for cross-origin requests (frontend-backend integration) ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Allows requests from any origin
@@ -22,40 +26,92 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers in requests
 )
 
-# Define the data model for chat requests using Pydantic
-# This ensures incoming request data is properly validated
-class ChatRequest(BaseModel):
-    messages: List[Dict[str, str]]  # Each message has 'role' and 'content'
-    model: Optional[str] = "gpt-4.1-mini"
-    api_key: str
+# --- RAG Pipeline Initialization (at startup) ---
+print("Loading and ingesting PDF for RAG pipeline...")
+pdf_path = "tests/tp_mayor_election.pdf"  # Change to your actual PDF path
 
-# Define the main chat endpoint that handles POST requests
-@app.post("/api/chat")
-async def chat(request: ChatRequest):
-    try:
-        # Initialize OpenAI client with the provided API key
-        client = OpenAI(api_key=request.api_key)
-        
-        # Create an async generator function for streaming responses
-        async def generate():
-            # Create a streaming chat completion request
-            stream = client.chat.completions.create(
-                model=request.model,
-                messages=request.messages,  # Pass the full history
-                stream=True  # Enable streaming response
-            )
-            
-            # Yield each chunk of the response as it becomes available
-            for chunk in stream:
-                if chunk.choices[0].delta.content is not None:
-                    yield chunk.choices[0].delta.content
+# 1. Load and split PDF
+documents = PDFLoader(pdf_path).load_documents()
+splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+chunks = splitter.split_texts(documents)
 
-        # Return a streaming response to the client
-        return StreamingResponse(generate(), media_type="text/plain")
+# 2. Build vector database (async)
+vector_db = VectorDatabase()
+vector_db = asyncio.run(vector_db.abuild_from_list(chunks))
+
+# 3. Initialize LLM and RAG pipeline
+llm = ChatOpenAI()
+rag_pipeline = RetrievalAugmentedQAPipeline(
+    vector_db_retriever=vector_db,
+    llm=llm,
+    response_style="detailed",
+    include_scores=True
+)
+
+# --- Request/Response Models ---
+class RAGQueryRequest(BaseModel):
+    question: str
+    k: int = 3
+
+class RAGQueryResponse(BaseModel):
+    answer: str
+    context: Optional[list] = None
     
+
+# --- Endpoint for user queries ---
+@app.post("/rag_answer", response_model=RAGQueryResponse)
+def rag_answer(request: RAGQueryRequest):
+    try:
+        result = rag_pipeline.run_pipeline(request.question, k=request.k)
+        return RAGQueryResponse(
+            answer=result["response"],
+            context=result["context"]
+        )
     except Exception as e:
-        # Handle any errors that occur during processing
         raise HTTPException(status_code=500, detail=str(e))
+
+# --- New endpoint for chat+file upload ---
+def get_loader_for_file(filename: str, path: str):
+    ext = filename.lower().split('.')[-1]
+    if ext == "pdf":
+        return PDFLoader(path)
+    elif ext == "docx":
+        return DocxLoader(path)
+    elif ext == "txt":
+        return TextFileLoader(path)
+    elif ext == "md":
+        return MarkdownLoader(path)
+    else:
+        raise ValueError("Unsupported file type")
+
+@app.post("/upload_and_ask")
+async def upload_and_ask(
+    message: str = Form(...),
+    file: Optional[UploadFile] = File(None)
+):
+    # 1. If file is present, save and ingest it
+    if file:
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="Uploaded file must have a filename.")
+        ext = file.filename.split('.')[-1]
+        temp_path = f"temp_upload.{ext}"
+        with open(temp_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        try:
+            loader = get_loader_for_file(file.filename, temp_path)
+            documents = loader.load_documents()
+            splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+            chunks = splitter.split_texts(documents)
+            # Ingest into the global vector_db (async)
+            await asyncio.get_event_loop().run_in_executor(
+                None, lambda: asyncio.run(vector_db.abuild_from_list(chunks))
+            )
+        finally:
+            os.remove(temp_path)
+
+    # 2. Run the RAG pipeline with the user's question
+    result = rag_pipeline.run_pipeline(message, k=3)
+    return {"answer": result["response"], "context": result.get("context", [])}
 
 # Define a health check endpoint to verify API status
 @app.get("/api/health")
@@ -67,3 +123,4 @@ if __name__ == "__main__":
     import uvicorn
     # Start the server on all network interfaces (0.0.0.0) on port 8000
     uvicorn.run(app, host="0.0.0.0", port=8000)
+

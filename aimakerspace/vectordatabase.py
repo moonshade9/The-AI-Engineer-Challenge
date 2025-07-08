@@ -48,6 +48,11 @@ class VectorDatabase:
         return self.vectors.get(key, None)
 
     async def abuild_from_list(self, list_of_text: List[str]) -> "VectorDatabase":
+        if len(list_of_text) > 0:
+            print("first item type:", type(list_of_text[0]))
+        list_of_text = [chunk for chunk in list_of_text if isinstance(chunk, str) and chunk.strip()]
+        if not list_of_text:
+            raise ValueError("No valid text chunks to embed.")
         embeddings = await self.embedding_model.async_get_embeddings(list_of_text)
         for text, embedding in zip(list_of_text, embeddings):
             self.insert(text, np.array(embedding))
